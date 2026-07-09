@@ -1,0 +1,27 @@
+*.local.*
+
+/node_modules/
+# CI/ローカルでの設計書参照用チェックアウト（コミットしない）
+/claude-poc-docs/
+
+/.next/
+next-env.d.ts
+
+# MSW 自動生成ファイル（npx msw init public/ で再生成）
+/public/mockServiceWorker.js
+
+.env.local
+
+coverage
+
+# 品質ゲート生成ファイル（ローカルパスを含むためコミットしない）
+eslint-report.json
+audit.json
+
+.skills-state
+
+dist
+
+tsconfig.tsbuildinfo
+
+src/lib/api/generated/

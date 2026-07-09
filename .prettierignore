@@ -1,0 +1,13 @@
+node_modules
+.next
+coverage
+claude-poc-docs
+.skills-state
+docs
+.github
+.claude
+audit.json
+eslint-report.json
+
+# MSW 自動生成ファイル（npx msw init public/ で再生成）
+public/mockServiceWorker.js

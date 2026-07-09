@@ -1,0 +1,263 @@
+# ============================================================
+# CICD — claude-poc-frontend 品質ゲート + デプロイ
+#
+# ワークフロー名は "CICD" で固定。
+# claude-fix-ci.yml の `workflows: ["CICD"]` と一致させること。
+#
+# フロー:
+#   build → [vitest, eslint, prettier] 並列
+#         → cd（workflow_dispatch + main ブランチのみ、AWS 設定完了後に中身を実装）
+#
+# スキップ条件:
+#   package.json または src/ ディレクトリが存在しない場合（基盤設定前）は
+#   build ジョブが should_skip=true を出力し、後続の全ジョブをスキップさせる。
+#   スキップ時は失敗にならず conclusion: skipped となる。
+#
+# アーティファクトはすべて GitHub Actions ストレージへの保存のみ。
+# リポジトリへの書き込み権限（contents: write）を持たないため
+# ブランチへの push は行われない。
+# ============================================================
+name: CICD
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write # AWS への認証に OIDC を使用するために必要
+
+env:
+  NODE_VERSION: '24'
+
+# ============================================================
+# ① Build — 依存関係インストール確認（後続ジョブの起動ゲート）
+#
+# package.json と src/ ディレクトリの両方が存在する場合のみ実行する。
+# どちらかが欠如している（基盤設定前など）はスキップを出力して正常終了する。
+# ============================================================
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.check-source.outputs.skip }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # 6.0.0
+
+      - name: Check source directory
+        id: check-source
+        run: |
+          if [ ! -f "package.json" ] || [ ! -d "src" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Build skipped::ソースディレクトリが存在しません（package.json: $([ -f package.json ] && echo '有' || echo '無'), src/: $([ -d src ] && echo '有' || echo '無')）。基盤設定前のため全ジョブをスキップします。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "package.json と src/ を確認。ビルドを実行します。"
+          fi
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        if: steps.check-source.outputs.skip != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies（npm ci）
+        if: steps.check-source.outputs.skip != 'true'
+        run: npm ci
+
+  # ============================================================
+  # ② 品質ゲート — 並列実行（build 成功後）
+  # ============================================================
+
+  # ── Vitest（単体テスト + カバレッジ）───────────────────────
+  vitest:
+    name: Test / Vitest
+    needs: build
+    if: needs.build.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # 6.0.0
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Vitest with coverage
+        # vitest.config.ts のカバレッジ閾値（100% / 除外後）が適用される
+        run: npx vitest run --coverage
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: vitest-results
+          path: |
+            coverage/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── ESLint ────────────────────────────────────────────────
+  eslint:
+    name: Lint / ESLint
+    needs: build
+    if: needs.build.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # 6.0.0
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        # JSON レポートを生成しつつ violations があれば失敗させる
+        run: |
+          npx eslint . \
+            --format json \
+            --output-file eslint-report.json \
+            --max-warnings=0
+
+      - name: Upload ESLint report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: eslint-report
+          path: eslint-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ── npm audit（脆弱性チェック）────────────────────────────
+  npm-audit:
+    name: Security / npm audit
+    needs: build
+    if: needs.build.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # 6.0.0
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit（critical / high を検出したら詳細を出力して失敗）
+        run: |
+          # --json で結果を取得（脆弱性があっても exit 1 になるため || true で継続）
+          npm audit --json > audit.json 2>/dev/null || true
+
+          # Node.js で critical / high を抽出してログ出力、検出数を返す
+          node -e "
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('audit.json', 'utf8'));
+            const vulnerabilities = Object.values(data.vulnerabilities || {});
+            let found = 0;
+            for (const v of vulnerabilities) {
+              if (v.severity === 'critical' || v.severity === 'high') {
+                const via = v.via.map(x => typeof x === 'string' ? x : x.title).join(', ');
+                console.log('[' + v.severity.toUpperCase().padEnd(8) + '] ' + v.name + ' | ' + via);
+                found++;
+              }
+            }
+            if (found > 0) {
+              console.error('');
+              console.error('critical または high の脆弱性が ' + found + ' 件検出されました。上記のパッケージを確認・更新してください。');
+              process.exit(1);
+            }
+            console.log('critical / high の脆弱性は検出されませんでした。');
+          "
+
+  # ── Prettier ──────────────────────────────────────────────
+  prettier:
+    name: Format / Prettier
+    needs: build
+    if: needs.build.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # 6.0.0
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting with Prettier
+        # フォーマットが一致しないファイルがあれば失敗する（修正は行わない）
+        run: npx prettier --check .
+
+  # ============================================================
+  # ③ CD — 手動実行のみ（workflow_dispatch + main ブランチ）
+  #    GitHub Flow: main が唯一のデプロイ対象。
+  #    AWS 設定完了後に各ステップの中身を実装すること。
+  # ============================================================
+  cd:
+    name: "CD / Deploy（手動）"
+    # 手動実行（workflow_dispatch）かつ main ブランチの場合のみ実行
+    # GitHub Flow: production/staging ブランチは存在せず、main が唯一のデプロイ対象
+    # ソースが存在しない場合（should_skip=true）もスキップ
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_name == 'main' &&
+      needs.build.outputs.should_skip != 'true'
+    needs: [build, vitest, eslint, prettier, npm-audit]
+    runs-on: ubuntu-latest
+    # environment: production
+    # AWS 設定完了後に有効化する。
+    # 有効化すると GitHub リポジトリの Settings > Environments で設定した
+    # 保護ルール（必須承認者・待機タイマー等）と環境シークレットが適用される。
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # 6.0.0
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build and push Docker image
+        id: build
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ vars.ECS_TASK_DEFINITION }} \
+            --query taskDefinition \
+            > taskdef.json
+      - name: Render new task definition with updated image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: taskdef.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ steps.build.outputs.IMAGE }}
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
